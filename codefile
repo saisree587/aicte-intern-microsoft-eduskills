@@ -1,0 +1,209 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.preprocessing import StandardScaler
+import yfinance as yf
+import datetime
+
+try:
+    import talib
+except ImportError:
+    print("TA-Lib is not installed. Please install it to use technical indicators.")
+    print("See instructions in the code comments for installation.")
+    print("Proceeding without TA-Lib, which will limit feature engineering.")
+    talib = None # Set to None if not found
+
+def get_technical_indicators(df):
+    """Calculates various technical indicators for the DataFrame."""
+    if talib:
+        df['SMA_10'] = talib.SMA(df['Close'], timeperiod=10)
+        df['EMA_10'] = talib.EMA(df['Close'], timeperiod=10)
+        df['RSI'] = talib.RSI(df['Close'], timeperiod=14)
+        macd, macdsignal, macdhist = talib.MACD(df['Close'], fastperiod=12, slowperiod=26, signalperiod=9)
+        df['MACD'] = macd
+        df['MACD_Signal'] = macdsignal
+        upper, middle, lower = talib.BBANDS(df['Close'], timeperiod=20)
+        df['BBL_Upper'] = upper
+        df['BBL_Middle'] = middle
+        df['BBL_Lower'] = lower
+        df['ATR'] = talib.ATR(df['High'], df['Low'], df['Close'], timeperiod=14)
+        df['OBV'] = talib.OBV(df['Close'], df['Volume'])
+    else:
+        print("TA-Lib not found. Skipping technical indicator creation.")
+    return df
+
+def process_and_predict_stock(ticker, start_date, end_date, prediction_horizon=1,
+                         test_size_ratio=0.2, n_estimators=100, random_state=42):
+    """
+    Processes data, trains a Random Forest Regressor, and predicts stock prices for a single ticker.
+    """
+    print(f"\n{'='*50}\n--- Processing Stock: {ticker} ---\n{'='*50}")
+
+    print(f"Fetching data for {ticker} from {start_date} to {end_date}")
+    try:
+        df = yf.download(ticker, start=start_date, end=end_date, progress=False) # progress=False to reduce clutter
+        if df.empty:
+            print(f"Error: No data fetched for {ticker}. Skipping.")
+            return None
+    except Exception as e:
+        print(f"Error fetching data for {ticker}: {e}. Skipping.")
+        return None
+
+    print(f"Data downloaded. Total {len(df)} data points.")
+
+    # 1. Feature Engineering
+    df['Target'] = df['Close'].shift(-prediction_horizon)
+
+    df['Close_lag1'] = df['Close'].shift(1)
+    df['Volume_lag1'] = df['Volume'].shift(1)
+    df['Open_lag1'] = df['Open'].shift(1)
+    df['High_lag1'] = df['High'].shift(1)
+    df['Low_lag1'] = df['Low'].shift(1)
+
+    df = get_technical_indicators(df)
+
+    # Drop rows with NaN values (from shifting and indicator calculations)
+    initial_rows = len(df)
+    df.dropna(inplace=True)
+    if len(df) < initial_rows:
+        print(f"Dropped {initial_rows - len(df)} rows due to NaN values after feature engineering.")
+
+    if df.empty:
+        print(f"After dropping NaNs, the dataframe for {ticker} is empty or has insufficient data. Skipping.")
+        return None
+
+    # Define features (X) and target (y)
+    features = [col for col in df.columns if col not in ['Target', 'Adj Close', 'Dividends', 'Stock Splits']]
+    X = df[features]
+    y = df['Target']
+
+    # Ensure X and y have enough samples after dropping NaNs
+    if len(X) <= 1 or len(y) <= 1:
+        print(f"Not enough data for {ticker} after feature engineering and dropping NaNs. Skipping.")
+        return None
+
+    # 2. Split Data into Training and Testing Sets (Time-based split)
+    split_index = int(len(df) * (1 - test_size_ratio))
+    if split_index == 0: # Ensure there's at least one training sample
+        split_index = 1
+    if split_index >= len(df): # Ensure there's at least one test sample
+        print(f"Not enough data for {ticker} to create a test set with ratio {test_size_ratio}. Skipping.")
+        return None
+
+    X_train, X_test = X.iloc[:split_index], X.iloc[split_index:]
+    y_train, y_test = y.iloc[:split_index], y.iloc[split_index:]
+    test_dates = df.index[split_index:]
+
+    if X_test.empty or y_test.empty:
+        print(f"Test set for {ticker} is empty after split. Skipping.")
+        return None
+
+    # 3. Feature Scaling
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+
+    X_train_scaled_df = pd.DataFrame(X_train_scaled, columns=X_train.columns, index=X_train.index)
+    X_test_scaled_df = pd.DataFrame(X_test_scaled, columns=X_test.columns, index=X_test.index)
+
+    print(f"Training Random Forest Regressor for {ticker}...")
+    # 4. Train the Model
+    model = RandomForestRegressor(n_estimators=n_estimators, random_state=random_state, n_jobs=-1)
+    model.fit(X_train_scaled_df, y_train)
+
+    # 5. Make Predictions on the Test Set
+    y_pred = model.predict(X_test_scaled_df)
+
+    # 6. Evaluate the Model
+    mse = mean_squared_error(y_test, y_pred)
+    rmse = np.sqrt(mse)
+    r2 = r2_score(y_test, y_pred)
+
+    print(f"\n--- Evaluation for {ticker} ---")
+    print(f"Mean Squared Error (MSE): {mse:.2f}")
+    print(f"Root Mean Squared Error (RMSE): {rmse:.2f}")
+    print(f"R-squared (R2): {r2:.2f}")
+    print(f"(R2 close to 1 indicates a better fit, but for stock prices, it's often low)")
+
+    # 7. Visualize the Results
+    plt.figure(figsize=(14, 7))
+    plt.plot(test_dates, y_test, label='Actual Close Price (Test)', color='blue', linewidth=2)
+    plt.plot(test_dates, y_pred, label='Predicted Close Price (Test)', color='red', linestyle='--', linewidth=2)
+    plt.title(f'{ticker} Stock Price Prediction (Random Forest - {prediction_horizon}-day horizon)')
+    plt.xlabel('Date')
+    plt.ylabel('Close Price')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+    # --- Attempting to predict the very next trading day ---
+    print(f"\n--- Predicting the next {prediction_horizon} trading day(s) for {ticker} ---")
+    # Get the last valid row of the original DataFrame (before dropping NaNs for target calculation)
+    # This ensures we get the most recent full set of features to make a "future" prediction
+    last_known_data_row = df.iloc[-1][features].to_frame().T # Use the last row with valid features for prediction
+
+    # Scale this last data row using the SAME scaler fitted on training data
+    last_known_data_scaled = scaler.transform(last_known_data_row)
+    last_known_data_scaled_df = pd.DataFrame(last_known_data_scaled, columns=X_train.columns)
+
+    next_prediction_value = model.predict(last_known_data_scaled_df)[0]
+
+    last_actual_date = df.index[-1]
+    # Calculate the future date based on prediction horizon and handle weekends
+    predicted_date = last_actual_date + pd.Timedelta(days=prediction_horizon)
+    # Simple check for weekends/holidays (not robust for all markets)
+    while predicted_date.weekday() > 4: # Monday is 0, Friday is 4
+        predicted_date += pd.Timedelta(days=1)
+    # Add a check for holidays if a holiday calendar is available
+    # For a robust solution, you'd need a proper business day calculation
+
+    print(f"Based on data up to {last_actual_date.strftime('%Y-%m-%d')}:")
+    print(f"Predicted Close Price for approx. {predicted_date.strftime('%Y-%m-%d')}: {next_prediction_value:.2f}")
+    print(f"Last actual known Close price: {df['Close'].iloc[-1]:.2f}")
+    print("\n--- REMINDER: This prediction is highly speculative and should NOT be used for financial decisions. ---")
+
+    return {
+        'ticker': ticker,
+        'rmse': rmse,
+        'r2': r2,
+        'next_predicted_price': next_prediction_value,
+        'predicted_date': predicted_date.strftime('%Y-%m-%d')
+    }
+
+if _name_ == "_main_":
+    # Define the list of stock tickers you want to predict
+    # You can change this list to any 5-10 (or more) valid tickers.
+    stock_tickers = ['AAPL', 'MSFT', 'GOOG', 'AMZN', 'TSLA', 'NVDA', 'JPM', 'V', 'PG'] # 9 objects
+
+    # Set common parameters for all predictions
+    current_date = datetime.date.today()
+    end_date = current_date.strftime('%Y-%m-%d')
+    start_date = (current_date - datetime.timedelta(days=5*365)).strftime('%Y-%m-%d') # Last 5 years of data
+    prediction_days_ahead = 1 # Predict 1 day into the future (next trading day)
+    num_trees = 200
+
+    all_results = []
+    for ticker in stock_tickers:
+        result = process_and_predict_stock(
+            ticker,
+            start_date,
+            end_date,
+            prediction_horizon=prediction_days_ahead,
+            n_estimators=num_trees
+        )
+        if result:
+            all_results.append(result)
+
+    print(f"\n\n{'='*60}\n--- Summary of Predictions for All Stocks ---")
+    if not all_results:
+        print("No successful predictions were made for any stock.")
+    else:
+        for res in all_results:
+            print(f"\nTicker: {res['ticker']}")
+            print(f"  Test RMSE: {res['rmse']:.2f}")
+            print(f"  Test R-squared: {res['r2']:.2f}")
+            print(f"  Predicted Price for {res['predicted_date']}: {res['next_predicted_price']:.2f}")
+    print(f"{'='*60}")
